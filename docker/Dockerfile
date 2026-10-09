@@ -5,10 +5,11 @@
 #
 # Base = the stack the numbers were measured on: lmsysorg/sglang v0.5.20 (CUDA 13.0, torch, Triton, nvcc) +
 # exllamav3 v1.5.1 built from source for TORCH_CUDA_ARCH_LIST (8.6 = RTX 3090; sm_86 binaries also run on sm_89).
-# For Blackwell (sm_120) rebuild with --build-arg TORCH_CUDA_ARCH_LIST="8.6;12.0" (not measured).
+# This branch (rtx5090) defaults to Blackwell RTX 5090 (sm_120) with PTX fallback; the base torch 2.13+cu130 ships sm_120.
+# For a 3090 build use --build-arg TORCH_CUDA_ARCH_LIST="8.6". Performance on sm_120 is not measured.
 FROM lmsysorg/sglang@sha256:06e4f2ed21afde4ff513cda65070124e727ba23ccaeff7712b8c40e1097d611f
 
-ARG TORCH_CUDA_ARCH_LIST="8.6"
+ARG TORCH_CUDA_ARCH_LIST="12.0+PTX"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ninja-build \
