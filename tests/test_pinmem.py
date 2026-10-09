@@ -15,6 +15,13 @@ N = 64 << 20      # 64 MiB region
 OFF = 4 << 20     # file offset (4096 aligned)
 dev = 0
 torch.zeros(1, device=f"cuda:{dev}")
+for small in (1000, 4096, 100000):   # small blocks: must still be page aligned, alias == host
+    sb, sa = pinmem.alloc(small, dev, f"small{small}")
+    assert sa % 4096 == 0
+    st = torch.frombuffer(sb, dtype=torch.uint8, count=4096)
+    st.fill_(7)
+    assert xe.pinned_cuda_view(st, dev).data_ptr() == sa
+    print(f"small {small}: host=0x{sa:x} ok")
 buf, a = pinmem.alloc(N, dev, "test")
 print(f"mode={pinmem.mode(dev)} host=0x{a:x}")
 t = torch.frombuffer(buf, dtype=torch.uint8, count=N)

@@ -83,14 +83,16 @@ def _hostalloc(nbytes, dev_idx):
     p = ctypes.c_void_p()
     with torch.cuda.device(dev_idx):
         torch.cuda.current_stream(dev_idx)       # make sure the primary context exists on this device
-        r = cu.cudaHostAlloc(ctypes.byref(p), nbytes, PORTABLE | MAPPED)
+        raw = nbytes + 4096                      # small cudaHostAlloc blocks are sub-allocated, not page aligned: slack
+        r = cu.cudaHostAlloc(ctypes.byref(p), raw, PORTABLE | MAPPED)
     if r != 0 or not p.value:
-        raise RuntimeError(f"cudaHostAlloc({nbytes} bytes = {nbytes / 2**30:.2f} GiB, Portable|Mapped) failed: {_err(r)}")
-    addr = p.value
+        raise RuntimeError(f"cudaHostAlloc({raw} bytes = {nbytes / 2**30:.2f} GiB, Portable|Mapped) failed: {_err(r)}")
+    base = p.value
+    addr = (base + 4095) // 4096 * 4096          # first page-aligned address inside the block (alias == host still holds)
 
     class HostAllocBuf(ctypes.c_ubyte * nbytes):
-        def __del__(self, _cu=cu, _a=addr):
-            _cu.cudaFreeHost(_a)   # argtypes c_void_p; no module globals (runs at shutdown)
+        def __del__(self, _cu=cu, _a=base):
+            _cu.cudaFreeHost(_a)   # frees the raw block; argtypes c_void_p; no module globals (runs at shutdown)
 
     return HostAllocBuf.from_address(addr), addr
 
