@@ -32,9 +32,11 @@ on a fast local NVMe filesystem (xfs or ext4).
 IMG=ghcr.io/sybil-solutions/glm53-flash-offload@sha256:aa74200f16c86588b101be2315aed2f643d148559179eef52a02599016b56e69   # v4.6-nvme
 hf download turboderp/GLM-5.3-Flash-exl3 --revision 332ab457b709b7ba30dd9a448be5de03b80a7ac9 --local-dir /data/glm53
 docker run --rm -v /data/glm53:/models:ro -v /mnt/nvme/glm53:/nvx "$IMG" pack-store     # once: 117 GB expert store
-docker run -d --name glm53 --gpus '"device=0"' --memory 55g --memory-swap 55g --shm-size 1g --ulimit memlock=-1 \
+docker run -d --name glm53 --gpus '"device=0"' --memory 55g --memory-swap 55g --shm-size 1g --ulimit memlock=-1 --ulimit nofile=1048576:1048576 \
   -e GLM53_MODE=nvme -e GLM53_EC_MAX_SLOTS=1376 -p 127.0.0.1:30000:30000 -v /data/glm53:/models:ro -v /mnt/nvme/glm53:/nvx:ro "$IMG"
 ```
+
+`--ulimit nofile=1048576:1048576` is needed on WSL2 (without it the VRAM pool allocation fails with "CUDA driver error: unknown error", EMFILE). On WSL2 the pinned RAM tier is allocated with `cudaHostAlloc` automatically (`GLM53_PIN_ALLOC=auto|register|hostalloc`).
 
 The server is ready in about 80 s at `http://127.0.0.1:30000/v1`, model `glm-5.3-flash`. For 16 GB of RAM use
 `--memory 16g --memory-swap 16g`. For bit-exact output use `GLM53_MODE=nvme-exact`. The all-RAM `fast` mode uses an

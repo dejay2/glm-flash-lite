@@ -78,6 +78,13 @@ def install(path=None):
     path = path or os.environ.get("GLM53_TRITON_PIN")
     if not path:
         return {}
+    import torch
+    cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+    if cap != (8, 6) and os.environ.get("GLM53_TRITON_PIN_FORCE") != "1":
+        gpu = f"sm_{cap[0]}{cap[1]}" if cap else "no CUDA device"
+        print(f" -- triton_pin: SKIPPED, {path} was tuned on sm_86 (RTX 3090) and this GPU is {gpu}; "
+              "Triton autotunes normally. GLM53_TRITON_PIN_FORCE=1 applies it anyway.", flush=True)
+        return {}
     PINNED.update(apply(json.load(open(path))))
     print(f" -- triton_pin: pinned {sorted(PINNED)} from {path}", flush=True)
     return PINNED

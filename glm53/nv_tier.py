@@ -299,25 +299,18 @@ def _rcs_bytes():
 
 
 class HostArena:
-    """Page-aligned anon memory, cudaHostRegister(Mapped) per chunk (charged to the memcg when registered)."""
+    """Page-aligned pinned memory per chunk (pinmem: mmap+cudaHostRegister, or cudaHostAlloc on WSL2; charged to the memcg)."""
 
     def __init__(self, nslots, slot_bytes, chunk_slots, dev_idx, tag):
         self.slot = slot_bytes
         self.n = nslots
         self.cs = chunk_slots
         self.maps, self.bases = [], []
-        from exllamav3.ext import exllamav3_ext as ext
+        import pinmem
         left = nslots
         while left > 0:
             k = min(left, chunk_slots)
-            mm = mmap.mmap(-1, k * slot_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-            a = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-            assert a % 4096 == 0
-            with torch.cuda.device(dev_idx):
-                r = torch.cuda.cudart().cudaHostRegister(a, k * slot_bytes, 2)
-            assert int(r) == 0, f"cudaHostRegister failed ({tag}): {r}"
-            t = torch.frombuffer(mm, dtype=torch.uint8, count=4096)
-            assert ext.pinned_cuda_view(t, dev_idx).data_ptr() == a, "UVA alias != host address"
+            mm, a = pinmem.alloc(k * slot_bytes, dev_idx, tag)   # alias == host address asserted inside
             self.maps.append(mm); self.bases.append(a)
             left -= k
         self.addr = np.array([self.bases[s // chunk_slots] + (s % chunk_slots) * slot_bytes for s in range(nslots)],

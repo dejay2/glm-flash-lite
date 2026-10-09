@@ -1,5 +1,5 @@
 // N119 nv2: shared layout between the device kernels (nv2_dev.cu) and the host engine (nv2_host.cpp).
-// All structs below live in ONE pinned, GPU-mapped host region (anon mmap + cudaHostRegister(Mapped)).
+// All structs below live in ONE pinned, GPU-mapped host region (glm53/pinmem.py: anon mmap + cudaHostRegister(Mapped), or cudaHostAlloc on WSL2).
 #pragma once
 #include <cstdint>
 

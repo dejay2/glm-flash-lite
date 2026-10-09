@@ -61,7 +61,7 @@ def prep_model(model):
     model_init.init (before the NVMe tier sizes its RAM arena from the cgroup headroom)."""
     from exllamav3.modules import Embedding
     from exllamav3.util.tensor import to2
-    import mmap, ctypes
+    import pinmem
     from exllamav3.ext import exllamav3_ext as xe
     dev_idx = torch.cuda.current_device()
     n = 0
@@ -73,10 +73,7 @@ def prep_model(model):
             continue
         nbytes = w.numel() * w.element_size()
         nb = (nbytes + 4095) // 4096 * 4096
-        mm = mmap.mmap(-1, nb, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-        a = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-        r = torch.cuda.cudart().cudaHostRegister(a, nb, 2)
-        assert int(r) == 0, f"cudaHostRegister(embedding) failed: {r}"
+        mm, a = pinmem.alloc(nb, dev_idx, "embedding")
         host = torch.frombuffer(mm, dtype=w.dtype, count=w.numel()).view(w.shape)
         host.copy_(w)
         assert torch.equal(host, w)
