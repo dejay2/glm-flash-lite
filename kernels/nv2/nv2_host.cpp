@@ -29,7 +29,8 @@ static inline void cpu_kern_init()
     const char* s = getenv("GLM53_NV_CPU_KERN");
     g_cpu_kern = s && *s ? atoi(s) : 0;
     n135::configure_env(); n135::init_p16();
-    fprintf(stderr, "[nv2] CPU lane kernel: %s (rg %d cg %d rd %d cd %d bandmaxm %d pfr %d p16 %d rt %d merge %d)\n", g_cpu_kern == 1 ? "n135 v4" : "ft_core moe_forward",
+    fprintf(stderr, "[nv2] CPU lane kernel: %s (isa %s, rg %d cg %d rd %d cd %d bandmaxm %d pfr %d p16 %d rt %d merge %d)\n", g_cpu_kern == 1 ? "n135 v4" : "ft_core moe_forward",
+            n135::use512() ? "avx512 (I16 p16 kernel; others avx2)" : "avx2",
             n135::K_.rg, n135::K_.cg, n135::K_.rd, n135::K_.cd, n135::K_.bandmaxm, n135::K_.pfr, n135::K_.kern, n135::K_.rt, n135::K_.merge);
 }
 static inline void cpu_moe_forward(Pool& pool, const Layer& L, const float* x, int ntok, const std::vector<std::vector<std::pair<int, float>>>& route,

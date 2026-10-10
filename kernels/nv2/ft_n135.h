@@ -38,17 +38,21 @@ struct Knobs
     int i16max = 2;      // auto mode: I16 when every expert has <= i16max tokens, else AFFINE (ft_core rule: 2)
     int merge = 1;       // engine: 1 = RAM and NVMe->CPU picks of a job in ONE forward (late-bound NVC jobs)
     int bandmaxm = 1;    // use the rg/cg/rd/cd band shapes only when the call's max tokens per job <= bandmaxm
+    int pfg = 1;         // AVX-512 kernel: software prefetch distance in 8-row groups
     int rt = 0;          // 1: I16 units keep a tile's accumulators in registers over each 8-row scale block (rt2; p16: m = 1 only)
 };
 inline Knobs K_;
 
+inline void select_isa(const char* v);
 inline void configure(const std::map<std::string, std::string>& A)
 {
     auto g = [&](const char* k, int& v) { auto it = A.find(k); if (it != A.end()) v = std::stoi(it->second); };
-    g("kern", K_.kern); g("rg", K_.rg); g("cg", K_.cg); g("rd", K_.rd); g("cd", K_.cd); g("pfr", K_.pfr); g("pfhint", K_.pfhint); g("pfpro", K_.pfpro); g("rt", K_.rt); g("bandmaxm", K_.bandmaxm); g("i16max", K_.i16max); g("merge", K_.merge);
+    { auto it = A.find("isa"); select_isa(it != A.end() ? it->second.c_str() : "auto"); }
+    g("kern", K_.kern); g("rg", K_.rg); g("cg", K_.cg); g("rd", K_.rd); g("cd", K_.cd); g("pfr", K_.pfr); g("pfhint", K_.pfhint); g("pfpro", K_.pfpro); g("rt", K_.rt); g("pfg", K_.pfg); g("bandmaxm", K_.bandmaxm); g("i16max", K_.i16max); g("merge", K_.merge);
 }
 inline void configure_env()
 {
+    select_isa(getenv("GLM53_NV_CPU_ISA"));
     auto g = [](const char* k, int& v) { const char* s = getenv(k); if (s && *s) v = atoi(s); };
     g("GLM53_NV_CPU_KERN_P16", K_.kern); g("GLM53_NV_CPU_RG", K_.rg); g("GLM53_NV_CPU_CG", K_.cg); g("GLM53_NV_CPU_RD", K_.rd);
     g("GLM53_NV_CPU_CD", K_.cd); g("GLM53_NV_CPU_PFR", K_.pfr); g("GLM53_NV_CPU_PFHINT", K_.pfhint); g("GLM53_NV_CPU_PFPRO", K_.pfpro); g("GLM53_NV_CPU_RT", K_.rt); g("GLM53_NV_CPU_BANDMAXM", K_.bandmaxm); g("GLM53_NV_CPU_MERGE", K_.merge); g("GLM53_NV_CPU_I16MAX", K_.i16max);
@@ -510,11 +514,30 @@ void rect_rt1(const Mat& mat, int r0, int R, int t0, int C, const void* const* x
     (void) ldy;
 }
 
+#include "ft_n135_512.h"
+
+// ISA selection: auto (default: AVX-512 p16 kernel when the CPU has avx512 f/bw/vl/dq/vbmi/vnni) | avx2 | avx512
+// (avx512 on a CPU without them falls back to avx2). Bench key isa=, engine env GLM53_NV_CPU_ISA.
+inline void select_isa(const char* v)
+{
+    const std::string s = v && *v ? v : "auto";
+    const bool has = cpu_has_512();
+    if (s == "avx2") g_isa512 = 0;
+    else if (s == "avx512" || s == "auto")
+    {
+        g_isa512 = has ? 1 : 0;
+        if (s == "avx512" && !has) fprintf(stderr, "[n135] GLM53_NV_CPU_ISA=avx512 but the CPU lacks avx512 f/bw/vl/dq/vbmi/vnni: using avx2\n");
+    }
+    else { fprintf(stderr, "[n135] unknown GLM53_NV_CPU_ISA=%s (auto|avx2|avx512): using auto\n", s.c_str()); g_isa512 = has ? 1 : 0; }
+    if (g_isa512 > 0) init_512();
+}
+
 inline void rect_m(int kind, int m, const Mat& mat, int r0, int R, int t0, int C, const void* const* x, const float* const* qs, float* y, size_t ldy)
 {
 #define N135_CASE(MM) case MM: \
     if (kind == 3 && MM == 1 && K_.rt && !mat.swz) rect_rt1<3>(mat, r0, R, t0, C, x, qs, y, ldy); \
     else if (kind == 2 && K_.rt && !mat.swz) rect_rt2<MM>(mat, r0, R, t0, C, x, qs, y, ldy); \
+    else if (kind == 3 && MM <= 2 && use512()) rect512<(MM <= 2 ? MM : 2)>(mat, r0, R, t0, C, x, qs, y, ldy); \
     else if (kind == 3) rect<MM, 3>(mat, r0, R, t0, C, x, qs, y, ldy); \
     else if (kind == 2) rect<MM, 2>(mat, r0, R, t0, C, x, qs, y, ldy); \
     else if (kind == 1) rect<MM, 1>(mat, r0, R, t0, C, x, qs, y, ldy); \

@@ -128,6 +128,15 @@ Numerics:
 - one token per expert: 3e-4 relative to the default kernel, the same error class against fp64;
 - two or more tokens per expert: bit-identical to the default kernel.
 
+**AVX-512 path (`GLM53_NV_CPU_ISA=auto|avx2|avx512`, default `auto`).** With `KERN=1`, the I16 p16 kernel has an AVX-512 version
+(`kernels/nv2/ft_n135_512.h`): `vpermb` + `vpmultishiftqb` extract 32 trellis states per register, `vpdpwssd` accumulates, and the
+eight accumulators of a tile stay in registers over each 8-row scale block. It is chosen at run time when the CPU has
+avx512 f/bw/vl/dq/vbmi/vnni, and the AVX2 kernels stay as the fallback and for every other mode (AFFINE, EXACT, `KERN=0`). Its
+integer sums are the same as the AVX2 kernel's, so the output is bit-identical to it (`bench/cpu_kernel/isa_compare.cpp`: 3,072
+random experts of the real store, 88 M values, 0 differences). Measured on a Ryzen 9 9950X3D: 2.2x faster on one thread
+(1.6 -> 0.73 ms per expert), 1.7x with 13 threads when the experts are L3-resident, but unchanged with 13 threads on cold
+experts (about 0.23-0.30 ms per expert, 36-40 GB/s: DRAM-bound), and unchanged end to end (see `results/cpu_kernel/`).
+
 Kernel microbench and logs: `bench/cpu_kernel/`, `results/cpu_kernel/`.
 
 ### 5. Host engine: one controller, landed flags, no per-layer host sync
@@ -351,6 +360,7 @@ These are the settings for the NVMe modes. Defaults are what the entrypoint sets
 | `GLM53_NV_CPU_THREADS` | 0 = one per CPU in `GLM53_NV_CPU_CPUS` | CPU-lane threads |
 | `GLM53_NV_CPU_KERN` | 0 | 1 = N135 CPU-lane forward (`ft_n135.h`); 0 = ft_core `moe_forward` |
 | `GLM53_NV_CPU_MERGE` / `GLM53_NV_CPU_BANDMAXM` | 1 / 1 | with `KERN=1`: NVMe->CPU picks in the same forward / use full-row units up to this many tokens per expert |
+| `GLM53_NV_CPU_ISA` | auto | with `KERN=1`: `auto` = AVX-512 p16 kernel if the CPU supports it, `avx2` = never, `avx512` = same as auto but warns when unsupported |
 | `GLM53_NV_CLAMP` | 1 | SwiGLU clamp on the CPU share (matches exllamav3) |
 | `GLM53_NV_CPU_CPUS`, `GLM53_MAIN_CPUS`, `GLM53_NV_CTL_CPU`, `GLM53_NV_READER_CPUS` | 2-23, 24, 25, 26-39 (or derived) | thread pinning |
 | `GLM53_NV_VERIFY_START` | 1 | byte-check sampled VRAM and RAM slots against the store at start |

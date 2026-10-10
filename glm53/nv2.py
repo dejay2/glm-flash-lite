@@ -62,6 +62,8 @@ def ext():
         here = os.path.join(root, "kernels", "nv2")   # nv2_host.cpp, nv2_dev.cu, nv2_shared.h, ft_core.h
         d = os.environ.get("GLM53_NV2_BUILD", os.path.join(root, "build", "nv2"))
         os.makedirs(d, exist_ok=True)
+        # ISA: the AVX-512 CPU-lane kernel (ft_n135_512.h) is compiled with function-level target attributes and picked at run time
+        # (GLM53_NV_CPU_ISA=auto|avx2|avx512, read by the extension), so the flags below stay the portable AVX2 baseline.
         _EXT = load(name="glm53_nv2", sources=[os.path.join(here, "nv2_host.cpp"), os.path.join(here, "nv2_dev.cu")],
                     build_directory=d, extra_cflags=["-O3", "-mavx2", "-mfma", "-mf16c", "-mtune=znver3", "-std=c++17",
                                                      "-I" + here],

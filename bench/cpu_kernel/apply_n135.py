@@ -100,4 +100,6 @@ if "N135 window clamp" not in c and "window clamp" not in c and "std::min(4 * (q
 else:
     print("ft_core.h: window clamp already present (main >= 4dafe6f)")
 shutil.copy(src_h, os.path.join(d, "ft_n135.h"))
+if os.path.exists(os.path.join(os.path.dirname(src_h), "ft_n135_512.h")):
+    shutil.copy(os.path.join(os.path.dirname(src_h), "ft_n135_512.h"), os.path.join(d, "ft_n135_512.h"))
 print("copied ft_n135.h ->", d)
