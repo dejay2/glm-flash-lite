@@ -204,11 +204,12 @@ __global__ void nv_step_k(const int64_t* __restrict__ sel, const __half* __restr
     const volatile int* ram_res, const int64_t* tabs, int* owner, int* refb, int* pin, int* ctl, int* jobs, int* jobx,
     int* jobnv, int maxj, unsigned long long* stats, const long long* __restrict__ cbase, int spc, long long rec,
     long long off_u, long long off_d, volatile long long* hc, const Rep* rep, long long* dc, const int* uidx, int* ulane,
-    LogE* wbl, LogE* adml, const volatile int* land, long long* dflag, long long timeout_ns, int wb_on, long long* dbg)
+    LogE* wbl, LogE* adml, const volatile int* land, long long* dflag, long long timeout_ns, int wb_on, long long* dbg,
+    int* trs, int ntrs, long long tbase)
 {
-    __shared__ unsigned mask[32];
-    __shared__ int misses[MAXU];
-    __shared__ int nmiss, nhit, epoch, s_ok;
+    __shared__ unsigned mask[32], tmask[32];
+    __shared__ int misses[MAXU], trl[MAXU];
+    __shared__ int nmiss, nhit, epoch, s_ok, ntr;
     __shared__ long long s_seq;
     const int t = threadIdx.x;
     if (t == 0)
@@ -229,7 +230,24 @@ __global__ void nv_step_k(const int64_t* __restrict__ sel, const __half* __restr
     const volatile Rep* rp = rep + (sq % RQ);
     const int nu = (int) dc[DC_NU];
     for (int u = t; u < nu; u += blockDim.x) ulane[u] = s_ok ? rp->lane[u] : LN_RAM;
+    if (trs)
+    {
+        // transient lane: the previous call's scratch rows go back to home (its MoE kernel is done: same stream)
+        const int pn = trs[0], pl = trs[1];
+        for (int i = t; i < pn; i += blockDim.x)
+        {
+            const int e = trs[2 + i];
+            const long long key = (long long) pl * E + e;
+            if (slotof_all[key] >= 0) continue;
+            int64_t* pg = (int64_t*) tabs[pl * 4 + 0]; int64_t* pu = (int64_t*) tabs[pl * 4 + 1];
+            int64_t* pd = (int64_t*) tabs[pl * 4 + 2]; int64_t* gu = (int64_t*) tabs[pl * 4 + 3];
+            const long long h0 = home_all[key * 3], h1 = home_all[key * 3 + 1], h2 = home_all[key * 3 + 2];
+            pg[e] = h0; pu[e] = h1; pd[e] = h2;
+            if (gu) { gu[2 * e] = h0; gu[2 * e + 1] = h1; }
+        }
+    }
     __syncthreads();
+    if (trs && t == 0) trs[0] = 0;
     for (int s = t; s < n; s += blockDim.x)
     {
         const long long e = sel[s] - first;
@@ -239,9 +257,10 @@ __global__ void nv_step_k(const int64_t* __restrict__ sel, const __half* __restr
         sel_out[s] = c ? -1 : sel[s];
         w_out[s] = c ? __float2half(0.0f) : w[s];
     }
-    if (t < 32) mask[t] = 0;
+    if (t < 32) { mask[t] = 0; tmask[t] = 0; }
     if (t == 0)
     {
+        ntr = 0;
         dflag[0] = (s_ok && rp->ncpu > 0) ? sq : 0;
         nmiss = 0; nhit = 0; epoch = ctl[1] + 1; ctl[1] = epoch; ctl[2] = 0;
     }
@@ -253,7 +272,8 @@ __global__ void nv_step_k(const int64_t* __restrict__ sel, const __half* __restr
         {
             const int u = uidx[e];
             const int ln = u >= 0 ? ulane[u] : LN_VRAM;
-            if (ln != LN_RZC && ln != LN_NZC) atomicOr(&mask[e >> 5], 1u << (e & 31));   // zero-copy lanes: no admission
+            if (ln == LN_RTR || ln == LN_NTR) atomicOr(&tmask[e >> 5], 1u << (e & 31));   // transient: scratch copy, no admission
+            else if (ln != LN_RZC && ln != LN_NZC) atomicOr(&mask[e >> 5], 1u << (e & 31));   // zero-copy lanes: no admission
         }
     }
     __syncthreads();
@@ -265,18 +285,32 @@ __global__ void nv_step_k(const int64_t* __restrict__ sel, const __half* __restr
             if (s >= 0) { refb[s] = 1; pin[s] = epoch; atomicAdd(&nhit, 1); }
             else { const int k = atomicAdd(&nmiss, 1); misses[k] = e; }
         }
+    for (int e = t; e < E; e += blockDim.x)
+        if (tmask[e >> 5] & (1u << (e & 31)))
+        {
+            const int k = atomicAdd(&ntr, 1);
+            if (k < ntrs) trl[k] = e;
+            else ulane[uidx[e]] = LN_RZC;      // no scratch slot left: read the landed RAM slot in place (zero-copy)
+        }
     __syncthreads();
     if (t != 0) return;
     stats[ST_HIT] += nhit; stats[ST_MISS] += nmiss;
-    if (!admit || S == 0) { if (dbg) dbg[(sq % DBG) * DBGW + 4] = (long long) gtime(); return; }
+    if (!admit || S == 0)
+    {
+        for (int i = 0; i < min((int) ntr, ntrs); i++) ulane[uidx[trl[i]]] = LN_RZC;   // no copy jobs: read in place
+        if (dbg) dbg[(sq % DBG) * DBGW + 4] = (long long) gtime();
+        return;
+    }
     int hand = ctl[0], nj = 0;
     int64_t* pg = (int64_t*) tabs[li * 4 + 0]; int64_t* pu = (int64_t*) tabs[li * 4 + 1];
     int64_t* pd = (int64_t*) tabs[li * 4 + 2]; int64_t* gu = (int64_t*) tabs[li * 4 + 3];
     long long wbn = dc[DC_WBN], admn = dc[DC_ADMN], lh = dc[DC_LANDH];
     const long long lt = ldv64(hc + HC_LANDT);
     bool full = false;
-    for (int pass = 0; pass < 2 && !full; ++pass)          // RAM-sourced jobs first, NVMe-sourced (landed wait) after
-        for (int k = 0; k < nmiss && nj < maxj; k++)
+    int ntrj = 0;
+    for (int pass = 0; pass < 2; ++pass)          // RAM-sourced jobs first, NVMe-sourced (landed wait) after
+    {
+        for (int k = 0; k < nmiss && nj < maxj && !full; k++)
         {
             const int e = misses[k];
             const int u = uidx[e];
@@ -325,6 +359,23 @@ __global__ void nv_step_k(const int64_t* __restrict__ sel, const __half* __restr
             nj++;
             stats[ST_ADMIT]++;
         }
+        // transient picks of this source class: host -> scratch slot S + i (jobx -1: no victim write-back)
+        for (int i = 0; i < min((int) ntr, ntrs); i++)
+        {
+            const int e = trl[i];
+            const int u = uidx[e];
+            if (ulane[u] != (pass ? LN_NTR : LN_RTR)) continue;
+            if (nj >= maxj) { ulane[u] = LN_RZC; continue; }
+            const long long a = tbase + (long long) i * rec;
+            pg[e] = a; pu[e] = a + off_u; pd[e] = a + off_d;
+            if (gu) { gu[2 * e] = a; gu[2 * e + 1] = a + off_u; }
+            jobs[2 * nj] = e; jobs[2 * nj + 1] = S + i; jobx[nj] = -1; jobnv[nj] = pass;
+            nj++;
+            stats[ST_TRANS]++;
+            trs[2 + ntrj] = e; ntrj++;
+        }
+    }
+    if (trs) { trs[0] = ntrj; trs[1] = li; }
     ctl[0] = hand; ctl[2] = nj;
     dc[DC_WBN] = wbn; dc[DC_ADMN] = admn; dc[DC_LANDH] = lh;
     if (dbg) { dbg[(sq % DBG) * DBGW + 4] = (long long) gtime(); dbg[(sq % DBG) * DBGW + 7] = nj; }
@@ -337,7 +388,7 @@ __global__ void nv_copy_k(const int* __restrict__ ctl, const int* __restrict__ j
     const long long* __restrict__ cbase, int spc, long long rec, long long vg, long long vu, long long vd, long long off_u,
     long long off_d, const long long* __restrict__ ram_addr, const long long* dc, const int* uexp, const int* ulane,
     const int* slotof_all, const int64_t* tabs, long long ph, volatile long long* hc, long long timeout_ns,
-    unsigned long long* stats, long long* dbg, long long* dcw)
+    unsigned long long* stats, long long* dbg, long long* dcw, int S, long long tbase)
 {
     const int t = threadIdx.x;
     const long long sqd = dc[DC_SEQ];
@@ -354,7 +405,7 @@ __global__ void nv_copy_k(const int* __restrict__ ctl, const int* __restrict__ j
         for (int u = t; u < nu; u += blockDim.x)
         {
             const int ln = ulane[u];
-            if (ln == LN_CPU || ln == LN_NVC || ln == LN_B70) continue;
+            if (ln == LN_CPU || ln == LN_NVC || ln == LN_B70 || ln == LN_RTR || ln == LN_NTR) continue;   // transient: rows set by nv_step
             const int e = uexp[u];
             const long long key = (long long) li * E + e;
             const int s = slotof_all[key];
@@ -412,7 +463,7 @@ __global__ void nv_copy_k(const int* __restrict__ ctl, const int* __restrict__ j
         }
         __syncthreads();
         const int s = jobs[2 * j + 1];
-        const long long dbase = cbase[s / spc] + (long long) (s % spc) * rec;
+        const long long dbase = s < S ? cbase[s / spc] + (long long) (s % spc) * rec : tbase + (long long) (s - S) * rec;
         int4 v[4]; int4* dst[4]; int4* wbd[4];
         int nn = 0;
         #pragma unroll
@@ -493,6 +544,26 @@ __global__ void nv_restore_k(const int64_t* __restrict__ idx, int n, int li, int
     if (gu) { gu[2 * e] = h0; gu[2 * e + 1] = h1; }
 }
 
+// transient lane: put the last call's scratch rows back to home (verify / idle), same restore nv_step does at the next call
+__global__ void nv_trflush_k(int* trs, int E, const int* __restrict__ slotof_all, const volatile long long* home_all, const int64_t* tabs)
+{
+    const int pn = trs[0], pl = trs[1];
+    __syncthreads();
+    for (int i = threadIdx.x; i < pn; i += blockDim.x)
+    {
+        const int e = trs[2 + i];
+        const long long key = (long long) pl * E + e;
+        if (slotof_all[key] >= 0) continue;
+        int64_t* pg = (int64_t*) tabs[pl * 4 + 0]; int64_t* pu = (int64_t*) tabs[pl * 4 + 1];
+        int64_t* pd = (int64_t*) tabs[pl * 4 + 2]; int64_t* gu = (int64_t*) tabs[pl * 4 + 3];
+        const long long h0 = home_all[key * 3], h1 = home_all[key * 3 + 1], h2 = home_all[key * 3 + 2];
+        pg[e] = h0; pu[e] = h1; pd[e] = h2;
+        if (gu) { gu[2 * e] = h0; gu[2 * e + 1] = h1; }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) trs[0] = 0;
+}
+
 // all rows of non-VRAM experts -> home (startup / after bulk residency changes)
 __global__ void nv_rows_all_k(int L, int E, const int* __restrict__ slotof_all, const volatile long long* home_all, const int64_t* tabs)
 {
@@ -538,7 +609,8 @@ void nv_step(at::Tensor sel, at::Tensor w, at::Tensor sel_out, at::Tensor w_out,
              at::Tensor owner, at::Tensor refb, at::Tensor pin, at::Tensor ctl, at::Tensor jobs, at::Tensor jobx,
              at::Tensor jobnv, at::Tensor stats, int64_t arena, int64_t spc, int64_t rec, int64_t off_u, int64_t off_d,
              int64_t hc, int64_t rep, at::Tensor dc, at::Tensor uidx, at::Tensor ulane, int64_t wbl, int64_t adml,
-             int64_t land, at::Tensor dflag, int64_t timeout_ns, int64_t wb_on, at::Tensor dbg)
+             int64_t land, at::Tensor dflag, int64_t timeout_ns, int64_t wb_on, at::Tensor dbg, at::Tensor trs, int64_t ntrs,
+             int64_t tbase)
 {
     c10::cuda::CUDAGuard g(sel.device());
     nv_step_k<<<1, 512, 0, cur(sel)>>>(sel.data_ptr<int64_t>(), (const __half*) w.data_ptr(), sel_out.data_ptr<int64_t>(),
@@ -549,13 +621,14 @@ void nv_step(at::Tensor sel, at::Tensor w, at::Tensor sel_out, at::Tensor w_out,
         (const long long*) arena, (int) spc, rec, off_u, off_d, (volatile long long*) hc, (const Rep*) rep,
         (long long*) dc.data_ptr<int64_t>(), uidx.data_ptr<int>(), ulane.data_ptr<int>(), (LogE*) wbl, (LogE*) adml,
         (const volatile int*) land, (long long*) dflag.data_ptr<int64_t>(), timeout_ns, (int) wb_on,
-        dbg.numel() ? (long long*) dbg.data_ptr<int64_t>() : nullptr);
+        dbg.numel() ? (long long*) dbg.data_ptr<int64_t>() : nullptr, ntrs > 0 ? trs.data_ptr<int>() : nullptr, (int) ntrs, tbase);
 }
 
 void nv_copy(at::Tensor ctl, at::Tensor jobs, at::Tensor jobx, at::Tensor jobnv, int64_t li, int64_t E, int64_t home,
              int64_t ram_res, int64_t arena, int64_t spc, int64_t rec, int64_t sg, int64_t su, int64_t sd, int64_t off_u,
              int64_t off_d, at::Tensor ram_addr, at::Tensor dc, at::Tensor uexp, at::Tensor ulane, at::Tensor slotof,
-             at::Tensor tabs, int64_t ph, int64_t hc, int64_t timeout_ns, at::Tensor stats, int64_t grid, at::Tensor dbg)
+             at::Tensor tabs, int64_t ph, int64_t hc, int64_t timeout_ns, at::Tensor stats, int64_t grid, at::Tensor dbg, int64_t S,
+             int64_t tbase)
 {
     c10::cuda::CUDAGuard g(ctl.device());
     nv_copy_k<<<(int) grid, 256, 0, cur(ctl)>>>(ctl.data_ptr<int>(), jobs.data_ptr<int>(), jobx.data_ptr<int>(),
@@ -564,7 +637,7 @@ void nv_copy(at::Tensor ctl, at::Tensor jobs, at::Tensor jobx, at::Tensor jobnv,
         (const long long*) ram_addr.data_ptr<int64_t>(), (const long long*) dc.data_ptr<int64_t>(), uexp.data_ptr<int>(),
         ulane.data_ptr<int>(), slotof.data_ptr<int>(), tabs.data_ptr<int64_t>(), ph, (volatile long long*) hc, timeout_ns,
         (unsigned long long*) stats.data_ptr<int64_t>(), dbg.numel() ? (long long*) dbg.data_ptr<int64_t>() : nullptr,
-        (long long*) dc.data_ptr<int64_t>());
+        (long long*) dc.data_ptr<int64_t>(), (int) S, tbase);
 }
 
 void nv_combine(at::Tensor out, at::Tensor dflag, int64_t done, int64_t hout, at::Tensor stats, int64_t hc, int64_t timeout_ns)
@@ -583,6 +656,13 @@ void nv_restore(at::Tensor idx, int64_t li, int64_t E, int64_t home, at::Tensor 
     if (!n) return;
     nv_restore_k<<<(n + 255) / 256, 256, 0, cur(idx)>>>(idx.data_ptr<int64_t>(), n, (int) li, (int) E,
         (const volatile long long*) home, tabs.data_ptr<int64_t>());
+}
+
+void nv_trflush(at::Tensor trs, int64_t E, at::Tensor slotof, int64_t home, at::Tensor tabs)
+{
+    c10::cuda::CUDAGuard g(trs.device());
+    nv_trflush_k<<<1, 128, 0, cur(trs)>>>(trs.data_ptr<int>(), (int) E, slotof.data_ptr<int>(), (const volatile long long*) home,
+        tabs.data_ptr<int64_t>());
 }
 
 void nv_rows_all(int64_t L, int64_t E, at::Tensor slotof, int64_t home, at::Tensor tabs)
@@ -613,5 +693,6 @@ void dev_bind(pybind11::module& m)
     m.def("nv_combine", &nv_combine, py::call_guard<py::gil_scoped_release>());
     m.def("peek", &peek, py::call_guard<py::gil_scoped_release>());
     m.def("nv_restore", &nv_restore);
+    m.def("nv_trflush", &nv_trflush);
     m.def("nv_rows_all", &nv_rows_all);
 }

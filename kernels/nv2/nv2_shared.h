@@ -19,7 +19,9 @@ enum { DC_SEQ = 0, DC_LANDH = 1, DC_WBN = 2, DC_ADMN = 3, DC_NU = 4, DC_TPUB = 5
 constexpr int DBGW = 8;    // debug ring words per request
 constexpr int DBG = 4096;   // latency debug ring (device: tpub, t_step, t_seen; host: t_notice, t_reply)
 // lanes (reply)
-enum { LN_RAM = 0, LN_NVG = 1, LN_CPU = 2, LN_VRAM = 3, LN_NVC = 4, LN_RZC = 5, LN_NZC = 6, LN_B70 = 7 };
+enum { LN_RAM = 0, LN_NVG = 1, LN_CPU = 2, LN_VRAM = 3, LN_NVC = 4, LN_RZC = 5, LN_NZC = 6, LN_B70 = 7, LN_RTR = 8, LN_NTR = 9 };
+// LN_RTR / LN_NTR (transient, GLM53_NV_TRANSIENT): GPU lane, the (landed) RAM / NVMe-landed expert's bytes are copied host->VRAM into a
+// per-call scratch slot (no CLOCK admission, no eviction, no write-back); the rows point at the scratch slot for this layer call only
 // LN_B70 (N137): computed by the B70 expert server from its own VRAM; masked on the GPU like a CPU pick, the CPU
 // worker posts it to the B70 ring and adds the returned rows into hout before HC_CDONE
 // LN_RAM / LN_NVG: GPU, admitted to VRAM (copy) | LN_RZC / LN_NZC: GPU zero-copy from the (landed) RAM slot, not admitted
@@ -49,6 +51,6 @@ struct LogE { int64_t seq; int32_t key, slot; };
 
 // stats (device uint64) indices
 enum { ST_HIT = 0, ST_MISS = 1, ST_ADMIT = 2, ST_NOVICT = 3, ST_EVICT = 4, ST_WB = 5, ST_WB_NOSLOT = 6, ST_FIX = 7,
-       ST_BAD = 8, ST_WAITNS = 9, ST_WAITS = 10, ST_CWAITNS = 11, ST_CWAITS = 12, ST_TIMEOUT = 13, ST_N = 16 };
+       ST_BAD = 8, ST_WAITNS = 9, ST_WAITS = 10, ST_CWAITNS = 11, ST_CWAITS = 12, ST_TIMEOUT = 13, ST_TRANS = 14, ST_N = 16 };
 
 }  // namespace nv2s

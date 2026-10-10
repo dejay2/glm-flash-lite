@@ -538,6 +538,17 @@ async def nv_verify(n: int = 64):
     return JSONResponse(nv_tier.NV.verify(n) if nv_tier.NV is not None else {"error": "GLM53_NV off"})
 
 
+@app.get("/nv_pol")
+async def nv_pol(set: str = "", reset: int = 0):
+    """nv2 planner cost model, same-server tuning: ?set=4=0.4,16=0.25 changes fields of the POL vector (index=value; layout =
+    the 10 GLM53_NV_POL fields, cpu_on, nvcpu_on, maxcpu, noadmit, transient_on, tr_slots, ttr, tadm, admk, thr, win); reset=1 zeroes
+    the counters (/stats decode_per_token) first. Takes effect at the next layer call."""
+    if os.environ.get("GLM53_NV") != "2":
+        return JSONResponse({"error": "GLM53_NV=2 only"}, status_code=400)
+    import nv2
+    return JSONResponse({"pol": nv2.NV.tune_pol(set, bool(reset))})
+
+
 @app.get("/la")
 async def la(on: int = 1):
     """N136: runtime lookahead switch for same-server A/B (takes effect at the next decode step)."""

@@ -135,6 +135,12 @@ struct Pol
     double g0 = 0.17, thit = 0.023, tzc = 0.38, ca = 0.145, cb = 0.165, ctok = 0.040, push = 0.40;
     double nvlat = 0.12, nvdeep = 0.395, nvone = 0.75;
     int cpu_on = 0, nvcpu_on = 0, maxcpu = 32, nv_noadmit = 0;
+    // transient lane (GLM53_NV_TRANSIENT): a host->VRAM scratch copy costs 1x link bytes (ttr), a CLOCK admission ~2x (tadm: the
+    // victim write-back shares the same link; < 0 -> tzc). At most tr_admk picks per layer are admitted (hottest by score >= tr_thr);
+    // the rest go transient while scratch slots (tr_slots) last. tr_win > 0: only keys already picked (non-VRAM) within the last
+    // tr_win decode tokens (tr_win x L layer calls) are admission candidates (second-touch filter: one-off picks stay transient).
+    int tr_on = 0, tr_slots = 0, tr_admk = 1 << 20, tr_win = 0;   // Python passes admk 3, win 4 when GLM53_NV_TRANSIENT=1
+    double ttr = 0.19, tadm = -1.0, tr_thr = -1e30;
 };
 
 struct Counters
@@ -142,7 +148,7 @@ struct Counters
     std::atomic<long long> reqs{0}, dec_reqs{0}, small_reqs{0}, picks{0}, vram{0}, ram{0}, nvme{0}, inflight_hit{0},
         lane_zc{0}, lane_cpu{0}, lane_nvg{0}, lane_nvc{0}, reads{0}, read_bytes{0}, wb_landed{0}, wb_dup{0}, adm_freed{0},
         adm_pinned{0}, evictions{0}, cpu_jobs{0}, cpu_experts{0}, cpu_tokens{0}, stage_ram{0}, stage_nv{0},
-        stage_reads{0}, read_err{0}, alloc_fail{0}, land_pushed{0}, prefetch{0}, dec_tok{0}, wb_issued{0}, wb_drop{0}, vring_hits{0}, notice_ns{0}, notice_max_ns{0}, serve_max_ns{0};
+        stage_reads{0}, read_err{0}, alloc_fail{0}, land_pushed{0}, prefetch{0}, dec_tok{0}, wb_issued{0}, wb_drop{0}, vring_hits{0}, lane_tr{0}, notice_ns{0}, notice_max_ns{0}, serve_max_ns{0};
     std::atomic<long long> lane_b70{0}, b70_jobs{0}, b70_rows{0}, b70_wait_ns{0}, b70_rtt_ns{0}, b70_err{0}, b70_rtt_max_ns{0};
     std::atomic<long long> reply_ns{0}, plan_ns{0}, ctl_busy_ns{0}, cpu_busy_ns{0}, cpu_wait_land_ns{0}, read_ms_x1000{0},
         stage_wait_ns{0}, stage_job_ns{0}, wb_bulk{0};
@@ -170,6 +176,8 @@ struct Engine
     std::vector<int32_t> freel;
     std::vector<uint8_t> prot; std::vector<int32_t> protl;
     std::vector<float> score;
+    std::vector<long long> lastmiss;   // transient lane: decode request index of the key's last non-VRAM pick (-1 never)
+    long long dreq = 0;                // decode requests planned so far (counts layer calls)
     std::mutex mu; std::condition_variable land_cv;
     int64_t land_tail = 0;
     struct WbP { int key, s, v; bool issued = false; };
@@ -417,7 +425,7 @@ struct Engine
     }
 
     // ---------------- plan_layer (moetier semantics) ----------------
-    struct PK { int u, key, cnt; double arr; float sc; };
+    struct PK { int u, key, cnt; double arr; float sc; bool adm = false; };
     std::vector<PK> V, Rm, N;
     void plan_and_reply(const Req& r, Rep& p)
     {
@@ -448,6 +456,26 @@ struct Engine
             }
         }
         if (dec) { C.picks += r.nu; C.vram += V.size(); C.ram += Rm.size(); C.nvme += N.size(); }
+        const bool tr = dec && pol.tr_on && pol.tr_slots > 0;
+        int ntr = 0;
+        if (tr)
+        {
+            // admission budget: the hottest (tokens, then warm score) tr_admk candidates at or above tr_thr are admitted
+            std::vector<PK*> cand;
+            const long long win = (long long) pol.tr_win * L;
+            auto ok = [&](const PK& k) { return k.sc >= pol.tr_thr && (win <= 0 || (lastmiss[k.key] >= 0 && dreq - lastmiss[k.key] <= win)); };
+            for (auto& k : Rm) if (ok(k)) cand.push_back(&k);
+            for (auto& k : N) if (ok(k)) cand.push_back(&k);
+            std::sort(cand.begin(), cand.end(), [](const PK* a, const PK* b) { return a->cnt != b->cnt ? a->cnt > b->cnt : (a->sc != b->sc ? a->sc > b->sc : a->key < b->key); });
+            for (size_t i = 0; i < cand.size() && (int) i < pol.tr_admk; ++i) cand[i]->adm = true;
+        }
+        if (tr)
+        {
+            for (auto& k : Rm) lastmiss[k.key] = dreq;
+            for (auto& k : N) lastmiss[k.key] = dreq;
+        }
+        if (dec) ++dreq;
+        const double tadm = pol.tadm >= 0 ? pol.tadm : pol.tzc;
         double g = V.empty() ? 0.0 : pol.g0 + pol.thit * V.size();
         double c = (cpu && (!Rm.empty() || !N.empty())) ? pol.ca : 0.0;
         int ncpu = 0;
@@ -456,8 +484,10 @@ struct Engine
         {
             if (!dec) { p.lane[k.u] = LN_RAM; C.lane_zc++; continue; }
             const double ce = c + pol.cb + pol.ctok * (k.cnt - 1);
-            const double ge = g + pol.tzc;
+            const bool asTr = tr && !k.adm && ntr < pol.tr_slots;
+            const double ge = g + (tr ? (asTr ? pol.ttr : tadm) : pol.tzc);
             if (cpu && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_CPU; ncpu++; C.lane_cpu++; }
+            else if (asTr) { g = ge; p.lane[k.u] = LN_RTR; ntr++; C.lane_tr++; }
             else { g = ge; p.lane[k.u] = LN_RAM; C.lane_zc++; }
         }
         std::sort(N.begin(), N.end(), [](const PK& a, const PK& b) { return a.arr < b.arr; });
@@ -465,8 +495,10 @@ struct Engine
         {
             const double a = std::max(0.0, k.arr);
             const double ce = std::max(c, a) + pol.cb + pol.ctok * (k.cnt - 1);
-            const double ge = std::max(g, a + pol.push) + pol.thit;
+            const bool asTr = tr && !k.adm && ntr < pol.tr_slots;
+            const double ge = asTr ? std::max(g, a) + pol.ttr : std::max(g, a + pol.push) + pol.thit;
             if (cpu && pol.nvcpu_on && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_NVC; ncpu++; C.lane_nvc++; }
+            else if (asTr) { g = ge; p.lane[k.u] = LN_NTR; ntr++; C.lane_tr++; }
             else if (dec && pol.nv_noadmit) { g = std::max(g, a) + pol.tzc; p.lane[k.u] = LN_NZC; C.lane_nvg++; }   // cold: zero-copy, keep VRAM
             else { g = ge; p.lane[k.u] = LN_NVG; C.lane_nvg++; }
         }
@@ -893,7 +925,7 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, int64_t rec_bytes, int64_t
     e.pf_ev.resize(e.pf_ring_addr.size()); e.pf_ev_pending.assign(e.pf_ring_addr.size(), 0);
     for (auto& ev : e.pf_ev) cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
     e.score.assign(score.data_ptr<float>(), score.data_ptr<float>() + e.K);
-    e.slot_of.assign(e.K, -1); e.kvr.assign(e.K, -1); e.kst.assign(e.K, KS_NONE); e.karr.assign(e.K, 0); e.prot.assign(e.K, 0);
+    e.slot_of.assign(e.K, -1); e.kvr.assign(e.K, -1); e.kst.assign(e.K, KS_NONE); e.karr.assign(e.K, 0); e.prot.assign(e.K, 0); e.lastmiss.assign(e.K, -1);
     e.owner.assign(e.nram, SL_FREE); e.pinc.assign(e.nram, 0); e.lprev.assign(e.nram, -1); e.lnext.assign(e.nram, -1);
     for (int s = e.nram - 1; s >= 0; --s) e.freel.push_back(s);
     for (int k = 0; k < e.K; ++k) { e.ram_res[k] = 0; e.set_home(k, ph); }
@@ -928,6 +960,13 @@ void set_pol(std::vector<double> v)
     if (v.size() > 11) p.nvcpu_on = int(v[11]);
     if (v.size() > 12) p.maxcpu = int(v[12]);
     if (v.size() > 13) p.nv_noadmit = int(v[13]);
+    if (v.size() > 14) p.tr_on = int(v[14]);
+    if (v.size() > 15) p.tr_slots = int(v[15]);
+    if (v.size() > 16) p.ttr = v[16];
+    if (v.size() > 17) p.tadm = v[17];
+    if (v.size() > 18) p.tr_admk = int(v[18]);
+    if (v.size() > 19) p.tr_thr = v[19];
+    if (v.size() > 20) p.tr_win = int(v[20]);
 }
 
 // blocking fill (warm start): keys -> resident (oldest-first LRU position order = given order)
@@ -1043,7 +1082,7 @@ std::vector<int64_t> counters()
         c.evictions, c.cpu_jobs, c.cpu_experts, c.cpu_tokens, c.stage_ram, c.stage_nv, c.stage_reads, c.read_err,
         c.alloc_fail, c.land_pushed, c.prefetch, c.plan_ns, c.ctl_busy_ns, c.cpu_busy_ns, c.cpu_wait_land_ns,
         c.read_ms_x1000, c.stage_wait_ns, c.stage_job_ns, c.wb_bulk, c.dec_tok, c.notice_ns, c.notice_max_ns, c.serve_max_ns, c.reply_ns, c.wb_issued, c.wb_drop, c.vring_hits,
-        c.lane_b70, c.b70_jobs, c.b70_rows, c.b70_wait_ns, c.b70_rtt_ns, c.b70_err, c.b70_rtt_max_ns };
+        c.lane_b70, c.b70_jobs, c.b70_rows, c.b70_wait_ns, c.b70_rtt_ns, c.b70_err, c.b70_rtt_max_ns, c.lane_tr };
     std::lock_guard<std::mutex> lk(e.mu);
     int res = 0, inf = 0; for (int k = 0; k < e.K; ++k) { res += e.kst[k] == KS_RES; inf += e.kst[k] == KS_INFLIGHT; }
     v.push_back(res); v.push_back(inf); v.push_back((int64_t) e.freel.size()); v.push_back(e.land_tail - e.hc[HC_WBN]);

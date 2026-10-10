@@ -22,6 +22,13 @@ Env: GLM53_NV_RAM_GB (auto), GLM53_NV_MARGIN_GB (3), GLM53_NV_THREADS (16 reader
      GLM53_NV_CPU_MODE (-1 auto), GLM53_NV_CLAMP (1: swiglu clamp on the CPU share, B004 fix), GLM53_NV_POL (cost model
      "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone"), GLM53_NV_MAXCPU (32), GLM53_NV_CTL_CPU (25),
      GLM53_NV_READER_CPUS (26-39), GLM53_NV_TIMEOUT_S (20), GLM53_NV_COPY_GRID (48)
+Transient decode lane (GLM53_NV_TRANSIENT=1, default off; RAM / just-landed NVMe picks that are not worth admitting): nv_step gives
+     them a scratch VRAM slot (GLM53_NV_TR_SLOTS, 24) instead of a CLOCK victim, nv_copy gathers the bytes there (1x link bytes, no
+     eviction, no write-back), the pointer rows target the scratch for this layer call only and are put back to home at the next
+     nv_step. The planner charges a transient copy ttr (GLM53_NV_TR_TTR 0.19 ms) and an admission tadm (GLM53_NV_TR_TADM, <0 = tzc),
+     admits at most GLM53_NV_TR_ADMK (3) candidates per layer call, and only keys already missed within GLM53_NV_TR_WIN (4) decode
+     tokens (second-touch filter) and with warm score >= GLM53_NV_TR_THR. GLM53_NV_POL may carry them as fields 11..15 after the
+     ten cost fields. Runtime tuning: GET /nv_pol?set=idx=val,..&reset=1.
 N137 B70 expert tier (needs the CPU tier, GLM53_NV_CPU=1): GLM53_B70 (0), GLM53_B70_RING (/run/local-ai/shared/b70.ring,
      created by b70tier/b70srv.py on the B70), GLM53_B70_N (3000 experts), GLM53_B70_ORDER (score: warm-score order after the VRAM warm
      set | rr: the RAM tier's round-robin rank), GLM53_B70_TIMEOUT_S (2). Decode picks of B70-resident experts are masked
@@ -194,9 +201,25 @@ class Nv2:
                int(self.wb_on), int(g("GLM53_NV_LAND", "64")), int(g("GLM53_NV_FREE_LO", "96")),
                torch.tensor(self.vring_addr, dtype=torch.int64))
         e.set_stage_qd(int(g("GLM53_NV_PF_QD", "24")))
-        pol = [float(x) for x in g("GLM53_NV_POL", "0.17,0.023,0.38,0.145,0.165,0.040,0.40,0.12,0.395,0.75").split(",")]
+        pol_all = [float(x) for x in g("GLM53_NV_POL", "0.17,0.023,0.38,0.145,0.165,0.040,0.40,0.12,0.395,0.75").split(",")]
+        pol, pol_tr = pol_all[:10], pol_all[10:]
+        # transient lane (GLM53_NV_TRANSIENT=1, default off): optional POL fields 11..15 = "ttr,tadm,admk,thr,win" (copy cost of a
+        # transient host->VRAM scratch copy [ms], cost of a CLOCK admission incl. its write-back [ms, <0 -> tzc], admissions
+        # allowed per layer call, minimum warm score to be admitted, second-touch window in decode tokens [0 = off]); env GLM53_NV_TR_TTR / _TADM /
+        # _ADMK / _THR / _WIN override
+        self.tr_slots = int(g("GLM53_NV_TR_SLOTS", "24")) if g("GLM53_NV_TRANSIENT", "0") == "1" else 0
+        trd = [0.19, -1.0, 3.0, -1e30, 4.0]
+        trv = [pol_tr[i] if i < len(pol_tr) else trd[i] for i in range(5)]
+        for i, k in enumerate(("TTR", "TADM", "ADMK", "THR", "WIN")):
+            if "GLM53_NV_TR_" + k in os.environ:
+                trv[i] = float(os.environ["GLM53_NV_TR_" + k])
         self.pol = pol + [1.0 if self.cpu_on else 0.0, 1.0 if g("GLM53_NV_NVCPU", "1" if self.cpu_on else "0") == "1" else 0.0,
-                          float(g("GLM53_NV_MAXCPU", "32")), 1.0 if g("GLM53_NV_NOADMIT", "1" if self.cpu_on else "0") == "1" else 0.0]
+                          float(g("GLM53_NV_MAXCPU", "32")), 1.0 if g("GLM53_NV_NOADMIT", "1" if self.cpu_on else "0") == "1" else 0.0,
+                          1.0 if self.tr_slots else 0.0, float(self.tr_slots), trv[0], trv[1], trv[2], trv[3], trv[4]]
+        # transient scratch: tr_slots VRAM slots (pointer-table targets for one layer call), device state = restore list
+        self.tr_t = torch.empty((max(self.tr_slots, 1), self.slot), dtype=torch.uint8, device=self.dev) if self.tr_slots else None
+        self.tr_base = self.tr_t.data_ptr() if self.tr_slots else 0
+        self.trs = torch.zeros(2 + max(self.tr_slots, 1), dtype=torch.int32, device=self.dev)
         e.set_pol(self.pol)
         # ---- the pool reads homes from the mapped table from now on (ec_step / ec_copy / ec_evict take its address)
         pool.home = self.home.view(self.L, self.E, 3)
@@ -238,7 +261,7 @@ class Nv2:
                  "lane_nvg", "lane_nvc", "reads", "read_bytes", "wb_landed", "wb_dup", "adm_freed", "adm_pinned",
                  "evictions", "cpu_jobs", "cpu_experts", "cpu_tokens", "stage_ram", "stage_nv", "stage_reads", "read_err",
                  "alloc_fail", "land_pushed", "prefetch", "plan_ns", "ctl_busy_ns", "cpu_busy_ns", "cpu_wait_land_ns",
-                 "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns",
+                 "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns", "lane_tr",
                  "resident", "inflight", "free", "landing"]
         return dict(zip(names, ext().counters()))
 
@@ -355,10 +378,10 @@ class Nv2:
         e.nv_step(s, ww, so, wo, n, p.first, li, self.E, p.S, int(dec), p.slotof, self.a["home"], self.a["res"], p.tabs,
                   p.owner, p.refb, p.pin, p.ctl, p.jobs, self.jobx, self.jobnv, self.dstats, p.cbase.data_ptr(), p.spc,
                   p.rec, p.off_u, p.off_d, self.a["hc"], self.a["rep"], self.dc, self.uidx, self.ulane, self.a["wbl"],
-                  self.a["adml"], self.a["land"], self.dflag, self.timeout_ns, int(self.wb_on), self.dbg)
+                  self.a["adml"], self.a["land"], self.dflag, self.timeout_ns, int(self.wb_on), self.dbg, self.trs, self.tr_slots, self.tr_base)
         e.nv_copy(p.ctl, p.jobs, self.jobx, self.jobnv, li, self.E, self.a["home"], self.a["res"], p.cbase.data_ptr(), p.spc,
                   p.rec, p.sg, p.su, p.sd, p.off_u, p.off_d, self.ram_addr_dev, self.dc, self.uexp, self.ulane, p.slotof,
-                  p.tabs, self.ph, self.a["hc"], self.timeout_ns, self.dstats, self.grid, self.dbg)
+                  p.tabs, self.ph, self.a["hc"], self.timeout_ns, self.dstats, self.grid, self.dbg, p.S, self.tr_base)
         self.st["dec_calls" if dec else "small_calls"] += 1
         return so.view(sel.shape), wo.view(w.shape), send_x
 
@@ -507,12 +530,30 @@ class Nv2:
         h[3].result()
         self.st["stage_wait_ms"] += (time.perf_counter() - t) * 1e3
 
+    def tune_pol(self, spec, reset):
+        """Runtime POL edit for same-server tuning (serve.py /nv_pol); 'idx=val,idx=val'. tr_slots (13+1) cannot exceed the scratch."""
+        for part in [x for x in spec.split(",") if x]:
+            i, _, v = part.partition("=")
+            i = int(i)
+            if not 0 <= i < len(self.pol):
+                raise ValueError(f"POL index {i} out of range 0..{len(self.pol) - 1}")
+            self.pol[i] = float(v)
+        if self.pol[15] > self.tr_slots:
+            raise ValueError(f"tr_slots {self.pol[15]} > allocated scratch {self.tr_slots}")
+        ext().set_pol(self.pol)
+        if reset:
+            ext().reset_counters()
+            self.dstats.zero_()
+        return self.pol
+
     # ---- checks / stats -----------------------------------------------------------------------------------------
     def verify(self, n=64, seed=0):
         """I1: sampled VRAM slots and RAM slots byte-compared against fresh O_DIRECT store reads; pointer tables, homes,
         landed flags consistent with the host's residency."""
         import random
         p = self.pool
+        if self.tr_slots:
+            ext().nv_trflush(self.trs, self.E, p.slotof, self.a["home"], p.tabs)   # last call's scratch rows back to home
         torch.cuda.synchronize(self.dev)
         ext().drain_all()
         rnd = random.Random(seed)
@@ -584,7 +625,7 @@ class Nv2:
         c = self.counters()
         d = self.dstats.tolist()
         dn = ["hit", "miss", "admit", "novict", "evict", "wb", "wb_noslot", "fix", "bad_rows", "reply_wait_ns", "reply_waits",
-              "nv_wait_ns", "nv_waits", "timeouts"]
+              "nv_wait_ns", "nv_waits", "timeouts", "transient"]
         dev = dict(zip(dn, d))
         steps = max(1, c["dec_reqs"] // self.L)
         toks = max(1, c["dec_tok"] // self.L)
@@ -596,7 +637,7 @@ class Nv2:
                                    "vram_hits": r(c["vram"] / steps), "ram_hits": r(c["ram"] / steps),
                                    "nvme": r(c["nvme"] / steps), "cpu_experts": r(c["cpu_experts"] / steps),
                                    "zc_admits": r(c["lane_zc"] / steps), "nvme_gpu": r(c["lane_nvg"] / steps),
-                                   "nvme_cpu": r(c["lane_nvc"] / steps),
+                                   "nvme_cpu": r(c["lane_nvc"] / steps), "transient": r(c["lane_tr"] / steps),
                                    "reply_wait_ms": r(d[9] / 1e6 / steps), "nvme_wait_ms": r(d[11] / 1e6 / steps),
                                    "cpu_busy_ms": r(c["cpu_busy_ns"] / 1e6 / steps),
                                    "b70_experts": r(c["lane_b70"] / steps), "b70_wait_ms": r(c["b70_wait_ns"] / 1e6 / steps)},
